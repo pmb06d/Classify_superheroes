@@ -1,0 +1,346 @@
+---
+title: "Superhero or Supervillain?"
+author: "Pedro Bonnin"
+output: word_document
+---
+
+#Introduction
+
+Can super power and demographic information for superheroes predict if they align good or bad?
+
+##About the data:
+The data set chosen contains demographic and power information scrapped from https://www.superherodb.com/ and posted on kaggle (https://www.kaggle.com/claudiodavi/superhero-set). It consisted of two csv files:
+
+* super_hero_powers.csv
+
+```{r}
+superPowers <- read.csv("C:/Users/pbonnin/Desktop/Local DataScience@Syracuse/IST565 Project/super_hero_powers.csv",stringsAsFactors = FALSE)
+
+#a data set with 667 examples with hero names and 167 different super powers.
+dim(superPowers)
+
+#data frame is a sort of sparse matrix with character strings for "true" and "false"
+str(superPowers[,1:10])
+```
+
+* heroes_information.csv
+
+```{r}
+superDemo <- read.csv("C:/Users/pbonnin/Desktop/Local DataScience@Syracuse/IST565 Project/heroes_information.csv",stringsAsFactors = FALSE)
+
+#has 734 examples of 10 variables
+str(superDemo)
+```
+
+At first glance it seemed as if the data would need minimal pre-processing but there were some decisions to be made as Na's were included as "-" character strings and "-99" values. Taking out every incomplete variable would leave me with less than 100 examples in the superdemo data frame so I decided to proceed as is.
+
+```{r}
+superDemoC <- superDemo
+superDemoC[superDemoC=="-"] <- NA
+superDemoC[superDemoC=="-99"] <- NA
+dim(superDemoC[complete.cases(superDemoC),])
+```
+
+## Data mining problem and methodology
+
+The goal of the exercise is:
+* To use AR mining, thinking of each hero as a "basket" of superpowers to see who superpowers go together and to see whether there is a pattern that can predict good or bad alignment.
+
+* Build a classification model using Naive Bayes, SVM or Random Forest algorithms to predict the alignment of the super heroes on a hold out sample.
+
+#Pre-processing
+
+```{r Loading libraries, warning=FALSE}
+#libraries
+library(arules)
+library(arulesViz)
+library(cluster)
+library(EMCluster)
+library(randomForest)
+library(caret)
+library(e1071)
+library(FSelector)
+library(wordcloud)
+```
+
+## Pre-processing super powers into binary
+
+```{r}
+SparsePowers <- superPowers
+SparsePowers[SparsePowers=="True"] <- 1
+SparsePowers[SparsePowers=="False"] <- 0
+SparsePowers[,2:ncol(SparsePowers)] <- as.data.frame(apply(SparsePowers[,2:ncol(SparsePowers)],2,as.numeric))
+```
+
+## Pre-processing demographics and publisher
+
+```{r}
+#dropping the ID number
+superDemo <- superDemo[,-1]
+superDemo <- superDemo[!duplicated(superDemo$name),]
+superDemoF <- superDemo
+
+#Looking at the weight for discretization, there are clearly a lot of examples with "-99" these range from human sized superheroes to Godzilla so its definitively a stand in for missing information
+hist(superDemo$Weight)
+
+#height shows the same thing as weight, "-99" values are stand ins for NA
+hist(superDemo$Height)
+
+#keeping only complete cases, turning height/weight into numeric attributes and replacing "-" with neutral for alignment and with "flesh" for skin color.
+
+superDemoF <- superDemoF[complete.cases(superDemoF),]
+superDemoF$Height <- as.numeric(superDemoF$Height)
+superDemoF$HeightNum <- superDemoF$Height
+superDemoF$Weight <- as.numeric(superDemoF$Weight)
+superDemoF$WeightNum <- superDemoF$Weight
+superDemoF$Alignment <- as.factor(gsub("-","neutral",superDemoF$Alignment))
+superDemoF$Skin.color <- as.factor(gsub("-","flesh",superDemoF$Skin.color))
+
+#turning the rest of the character vectors into factors
+superDemoF[,c("Gender","Eye.color","Race","Hair.color","Publisher")] <- as.data.frame(apply(superDemoF[,c("Gender","Eye.color","Race","Hair.color","Publisher")],2,as.factor))
+```
+
+When discretizing height and weight the values were centered around what a human would normally have. This will make it easier to understand these bins.
+
+```{r}
+#discretizing weight and height
+superDemoF$Weight <- cut(superDemoF$Weight, breaks = c(-Inf,-90,50,200,400,Inf), labels = c("-","Ultra.Light","Normal","Heavy","Ultra.Heavy"))
+superDemoF$Weight <- ordered(superDemoF$Weight,c("-","Ultra.Light","Normal","Heavy","Ultra.Heavy"))
+superDemoF$Height <- cut(superDemoF$Height, breaks = c(-Inf,-90,35,150,200,250,Inf), labels = c("-","Tiny","Short","Normal","Tall","Huge"))
+superDemoF$Height <- ordered(superDemoF$Height,c("-","Tiny","Short","Normal","Tall","Huge"))
+superDemoF[superDemoF==-99] <- 0
+
+#merging the two dataframes
+superDF <- merge.data.frame(superDemoF,superPowers, by.y = "hero_names" , by.x = "name", all.y = TRUE)
+
+#a superDF with powers in binary instead of strings
+superDF2 <- merge.data.frame(superDemoF,SparsePowers, by.y = "hero_names" , by.x = "name", all.y = TRUE)
+superDF2 <- superDF2[complete.cases(superDF2),]
+```
+
+There are too many factors in some of the vectors for superDemo. Especially for race.
+
+```{r}
+str(superDemoF)
+```
+
+Need to boil race down to less factors but it is not immediately obvious how to group them so k means clustering was used to find these groups.
+
+### Clustering to replace Race
+K means clustering was used using base R and the numeric variables (super power sparse matrix and numeric height and weight) 
+
+```{r}
+#trying out different k's using the numeric variables (super power sparse matrix and numeric height and weight)
+data <- superDF2[,11:ncol(superDF)]
+```
+
+Sum of squares was used to determine how many K's to use:
+
+```{r}
+set.seed(50)
+wss <- sapply(15:30,function(k){kmeans(data, k, iter.max = 30 )$tot.withinss})
+#elbow plot for kmeans
+set.seed(50)
+plot(15:30, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+```
+
+Settled on 24 since I didn't want to boil down race too much but clusters overlap a lot
+
+```{r}
+set.seed(50)
+superKMean <- kmeans(superDF2[,11:ncol(superDF)], 24)
+clusplot(superDF2[,11:ncol(superDF)],superKMean$cluster,color = TRUE,lines = 0, main = "SuperPower Clusters")
+
+#clusters into the data frame
+superDF3 <- data.frame("Clusters"=as.factor(superKMean$cluster),superDF2)
+```
+
+#AR Mining
+This data set lends itself very well to AR mining because of the large number of incomplete examples and the way that the are different "baskets" of superpowers and characteristics. 
+
+```{r}
+#dropping incomplete values from before to exclude from the "baskets" 
+superDF2AR <- superDF2
+superDF2AR[superDF2AR=="-"] <- NA
+superDF2AR[superDF2AR=="flesh"] <- NA
+superDFTran <- as(cbind(superDF2AR[,2:10],superDF2[,13:ncol(superDF2)]==1), "transactions")
+itemFreq <- sort(itemFrequency(superDFTran),decreasing = TRUE)
+
+#top 10 items: males, good alignment, normal weight and height, Super strenght and stammina all appear, at least individually, in more than 40% of the baskets
+itemFreq[1:10]
+```
+
+Set a very high confidence threshold since a lot of rules would tie at this level.
+The limit on the length of the rules is set to 10 because some characters have a lot of superpowers.
+
+```{r message=FALSE, warning=FALSE}
+superRules <- apriori(superDFTran, parameter = list(supp = 0.05, conf = 1, maxlen = 10))
+superRules <- sort(superRules, by = "support", decreasing = TRUE)
+```
+
+Top 5 rules for confidence = 1, sorted by support show the most common co-occurrence for super strength and normal height
+
+```{r}
+inspect(superRules[1:5])
+```
+
+Lowering the confidence and sorting by lift yields some more interesting rules
+
+```{r message=FALSE, warning=FALSE}
+superRules <- apriori(superDFTran, parameter = list(supp = 0.05, conf = 0.9, maxlen = 10))
+superRules <- sort(superRules, by = "lift", decreasing = TRUE)
+```
+
+Top 5 rules sorted by lift show high correlation between weapon based super powers and marksmanship
+
+```{r}
+inspect(superRules[1:5])
+```
+
+## What powers coincide with good and bad alignment? 
+Since there are a lot more good guys than bad guys, the support had to be lowered for the bad guy rules. The confidence is set relatively high so the rules are sorted by support.
+
+```{r message=FALSE, warning=FALSE}
+#good guys
+superRules4 <- apriori(superDFTran, parameter = list(supp = 0.05, conf = 0.9, maxlen = 10),appearance = list(default="lhs",rhs="Alignment=good"), control = list(verbose = F))
+superRules4 <- sort(superRules4, by = "support", decreasing = TRUE)
+
+#bad guys
+superRules5 <- apriori(superDFTran, parameter = list(supp = 0.01, conf = 0.9, maxlen = 10),appearance = list(default="lhs",rhs="Alignment=bad"), control = list(verbose = F))
+superRules5 <- sort(superRules5, by = "lift", decreasing = TRUE)
+```
+
+Features like blond hair, blue eyes and normal height and weight co-occur with being a good guy, especially when the hero is from marvel
+```{r}
+inspect(superRules4[!is.redundant(superRules4)][1:10])
+```
+
+Powers related to cold, intelligence and red eye color are most associated with being a bad guy
+```{r}
+inspect(superRules5[!is.redundant(superRules5)])
+```
+
+#Sampling the data sets
+A hold out sample was created to test the accuracy of the classification models, 30% of good and bad alignment examples were randomly selected for this purpose.
+
+```{r}
+#separating good and bad for stratified samples
+goodDF <- superDF3[superDF3$Alignment=="good",]
+badDF <- superDF3[superDF3$Alignment=="bad",]
+neutralDF <- superDF3[superDF3$Alignment=="neutral",]
+
+set.seed(10)
+goodIndexes <- sample(1:nrow(superDF3[superDF3$Alignment=="good",]))
+badIndexes <- sample(1:nrow(superDF3[superDF3$Alignment=="bad",]))
+
+#training and testing good DF
+#length(goodIndexes)
+goodTest <- goodDF[goodIndexes[1:130],]
+goodTrain <- goodDF[goodIndexes[131:length(goodIndexes)],]
+
+#training and testing bad DF
+#length(badIndexes)
+badTest <- badDF[badIndexes[1:60],]
+badTrain <- badDF[badIndexes[61:length(badIndexes)],]
+
+#Merging back together both samples
+superTest <- rbind(goodTest,badTest)
+superTrain <- rbind(goodTrain,badTrain)
+
+superTrain$Alignment <- factor(superTrain$Alignment)
+superTest$Alignment <- factor(superTest$Alignment)
+
+#dropping variables with too many factors (using clusters instead) = names, race, eye
+superTest <- superTest[,-c(2,5,12,13)]
+superTrain <- superTrain[,-c(2,5,12,13)]
+superDF4 <- superDF3[,-c(2,5,12,13)]
+```
+
+Some algorithms work much better when all variables are factors so a copy of the data sets was turned into factors
+
+```{r}
+superTrainF <- superTrain
+superTrainF$REF <- rep("Train",nrow(superTrainF))
+superTrainF[,10:ncol(superTrainF)] <- as.data.frame(apply(superTrainF[,10:ncol(superTrainF)],2,as.factor))
+
+superTestF <- superTest
+superTestF$REF <- rep("Test",nrow(superTestF))
+
+factorizer <- rbind(superTrainF,superTestF)
+factorizer[,10:ncol(factorizer)] <- as.data.frame(apply(factorizer[,10:ncol(factorizer)],2,as.factor))
+
+superTestF <- factorizer[factorizer$REF=="Test",]
+superTestF <- subset(superTestF, select=-c(REF))
+
+superTrainF <- factorizer[factorizer$REF=="Train",]
+superTrainF <- subset(superTrainF, select=-c(REF))
+```
+
+#Training the different algorithms
+Random Forest, radial SVM and Naive Bayes models were trained on the sampled data and used on the hold out sample to check for accuracy
+
+```{r}
+#Random forests
+set.seed(100)
+superRF_F <- randomForest(Alignment~.,superTrainF)
+importance <- as.data.frame(superRF_F$importance)
+superPredict <- predict(superRF_F,superTestF[,-8])
+
+#Naive Bayes
+set.seed(100)
+superNB_DefaultR <- naiveBayes(Alignment~.,superTrainF)
+BayesNB_Test <- predict(superNB_DefaultR,superTestF[,-8])
+
+#SVM
+set.seed(50)
+superRadialSVM <- svm(Alignment~.,superTrain, kernel = "radial", cost = 500 ,na.action = na.omit)
+superSVM_TEST <- predict(superRadialSVM,superTest[,-8])
+```
+
+All the algorithms have a really hard time at classifying bad guys. Naive Bayes performs the best out of the three for both categories.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+RF_Accuracy <- confusionMatrix(superTest$Alignment,superPredict)$overall[1]
+RF_AccuracyG <- confusionMatrix(superTest$Alignment,superPredict,mode = "prec_recall", positive = "good")$byClass[5:6]
+RF_AccuracyB <- confusionMatrix(superTest$Alignment,superPredict,mode = "prec_recall", positive = "bad")$byClass[5:6]
+RF_Results <- cbind("Accuracy"=RF_Accuracy[1],"Precision (good)"=RF_AccuracyG[1],"Recall (good)"=RF_AccuracyG[2],"Precision (bad)"=RF_AccuracyB[1],"Recall (bad)"=RF_AccuracyB[2])
+rownames(RF_Results) <- "Random Forest"
+
+Bayes_Accuracy <- confusionMatrix(superTest$Alignment,BayesNB_Test)$overall[1]
+Bayes_AccuracyG <- confusionMatrix(superTest$Alignment,BayesNB_Test,mode = "prec_recall", positive = "good")$byClass[5:6]
+Bayes_AccuracyB <- confusionMatrix(superTest$Alignment,BayesNB_Test,mode = "prec_recall", positive = "bad")$byClass[5:6]
+Bayes_Results <- cbind("Accuracy"=Bayes_Accuracy[1],"Precision (good)"=Bayes_AccuracyG[1],"Recall (good)"=Bayes_AccuracyG[2],"Precision (bad)"=Bayes_AccuracyB[1],"Recall (bad)"=Bayes_AccuracyB[2])
+rownames(Bayes_Results) <- "Naive Bayes"
+
+SVM_Accuracy <- confusionMatrix(superTest$Alignment,superSVM_TEST)$overall[1]
+SVM_AccuracyG <- confusionMatrix(superTest$Alignment,superSVM_TEST,mode = "prec_recall", positive = "good")$byClass[5:6]
+SVM_AccuracyB <- confusionMatrix(superTest$Alignment,superSVM_TEST,mode = "prec_recall", positive = "bad")$byClass[5:6]
+SVM_Results <- cbind("Accuracy"=SVM_Accuracy[1],"Precision (good)"=SVM_AccuracyG[1],"Recall (good)"=SVM_AccuracyG[2],"Precision (bad)"=SVM_AccuracyB[1],"Recall (bad)"=SVM_AccuracyB[2])
+rownames(SVM_Results) <- "Radial SVM"
+```
+```{r}
+rbind(Bayes_Results,RF_Results,SVM_Results)
+```
+
+##Variable importance
+The top feature for random forest was the k-mean clusters, the rest concentrated around the "demographic" variables like hair color, publisher and eye color. Confirming some of the trends observed in the association rule results.
+
+```{r}
+wordcloud(rownames(importance),importance$MeanDecreaseGini)
+```
+
+CHI squared variable importance also shows the clusters, hair color and eye color as the most important variables but there is not as much separation between these and some of the super powers when compared to Random Forests.
+
+```{r}
+CHI2 <- chi.squared(Alignment~.,superTrainF)
+CHI2 <- CHI2[order(-CHI2$attr_importance), , drop = FALSE]
+head(CHI2,10)
+wordcloud(rownames(CHI2),CHI2$attr_importance,colors = TRUE,max.words=20)
+```
+
+#Conclusion and Discussion
+The most meaningful results for this problem were derived from APRIORI, although the classification algorithms confirmed some of what was observed in the association rules. Blond hair color, blue eyes and "human-range" weight and height seem to be good predictors of super heroes and cold related powers, red eye color are correlated with bad guys. 
+For classification, Naive Bayes had good overall accuracy, but struggles to classify bad guys with around ~.50 precision and recall. Although lacking direct real world impact, this exercise shows the skills needed in setting up and applying a classification model to a novel data set.
